@@ -1,2 +1,79 @@
-# rog-azoth-oled
-ROG Azoth M701 OLED 多页显示：硬件监控、Codex 周额度、拨杆交互和 Windows 后台自启。
+# ROG 夜魔 M701 OLED 多页显示
+
+针对本机 USB 设备 `0B05:1A83`（USB 修订值 `0x0414`）的电脑端程序，需要 Gear Link Companion 正在运行。
+
+## 首次配置
+
+仓库仅提供示例配置。首次运行前，将 `config.example.json` 复制为 `config.json`，把 `codexUsage.baseUrl` 改为自己的额度服务地址，再运行 `设置额度接口Key.ps1` 输入该服务的 Key。示例中的 `.example` 域名不能用于实际连接。
+
+`config.json`、`.local/`、`.tools/`、`build/`、运行时、日志、环境文件和加密凭据均不纳入 Git。请勿将实际服务地址或 Key 写入源码、测试或文档。测试中的 `TEST_KEY_DO_NOT_USE` 是虚构占位值。
+
+## 交互
+
+- 默认进入信息浏览模式，显示 CPU/GPU 温度。
+- 下拨切换：温度 → CPU/GPU 占用率 → Codex 额度 → 温度；上拨反向切换。
+- 在信息页按下拨杆，重新显示当前页面。
+- 按独立按钮，进入原厂音量、媒体、键盘灯亮度、OLED 亮度、灯效等已启用控制模式，继续按按钮循环切换。
+- 在控制页，拨杆保留原厂调整和按下功能。
+- 最后一次按钮或拨杆操作后 5 秒，自动回到之前的信息页；此后拨杆再次用于翻页。
+
+## 启动和停止
+
+正式版安装在 `%LOCALAPPDATA%\AzothOLED`，登录 Windows 后自动在系统托盘运行。也可通过开始菜单的“ROG 夜魔 OLED”启动。托盘菜单提供启动、暂停并恢复原厂显示、重新连接、设置 Key 和退出等功能；运行日志和状态在安装目录的 `.local` 中。
+
+运行 `停止并恢复.ps1` 会停止程序并恢复启动前的硬件监控配置、原厂拨杆映射及控制模式。异常退出后，也可以使用此脚本恢复。恢复时应保持 USB 连接，且仍处于启动时使用的键盘配置。
+
+程序自带 Node 和 Python/HID 运行时，不依赖 Codex 应用或工作区持续打开；仍需本机 Gear Link Companion 提供硬件传感器。设备和服务未就绪时后台会自动重试。电脑端程序退出后不提供多页显示，当前仅实现 USB 有线连接。
+
+运行安装目录的 `取消开机自启.ps1` 可以取消登录自启。开发源代码仍可用工作区的 `启动.ps1` 手动运行，正式版运行时请先从托盘退出再启动开发版。
+
+## 设置
+
+编辑 `config.json` 后重启程序：
+
+| 设置 | 含义 |
+|---|---|
+| `pages` | 信息页顺序：`temperature`、`utilization`、`codex` |
+| `defaultPage` | 启动显示的页面 |
+| `adjustmentTimeoutMs` | 控制模式无操作后返回信息页的毫秒数 |
+| `hardwareRefreshMs` | 后台硬件数据采样间隔，默认一秒；翻页不等待采样 |
+| `codexRefreshMs` | Codex 额度刷新间隔，默认一分钟 |
+| `codexDisplayMode` | `image` 使用无 ROG 横幅的自定义图片；`banner` 为旧横幅模式 |
+| `codexUsage.baseUrl` | 自行填写额度服务地址；仓库不含实际接口地址 |
+| `codexUsage.timeoutMs` | 后台 HTTP 请求超时，默认 25 秒；不阻塞拨杆翻页 |
+
+Codex 数据只通过局域网虚拟机的 `GET /api/usage` 读取，不启动或调用本地 Codex。优先显示接口的 `remainingPercent`，以 `windowDurationMins` 判断周期，保留服务器实际抓取时间 `fetchedAt`；缺失值不会显示为零。
+
+首次运行 `设置额度接口Key.ps1`，在本地密码框输入服务端正在使用的 `apiKey`。脚本使用 Bearer 请求头验证数据接口，成功后通过 Windows DPAPI 按当前用户加密保存到 `.local/codex-usage-key.dpapi`，并立即通知运行中的 OLED 程序刷新。Key 不进入普通配置、URL、聊天或日志，也可由 `CODEX_USAGE_API_KEY` 环境变量提供。
+
+`/health` 正常仅代表 HTTP 服务运行。额度读取失败会记录状态码和经过筛选的 `error.code`；屏幕无缓存时显示接口不可用或需要 Key，有缓存时标记 `STALE`，避免把旧数据当作实时额度。请求失败不会切回本地 Codex。
+
+## 实现与限制
+
+本机固件接受 `0x71/0`（启用拨杆模式）和 `0x71/1`（自定义拨杆映射），拒绝新版 `0x71/2`（直接选择模式）及部分新查询命令。停用当前模式时，实机自动跳到下一个可用模式。
+
+因此程序将原厂自定义模式 7 用作信息浏览模式。返回浏览时，短暂停用其他已启用控制模式，验证模式 7，再恢复原控制模式。未刷固件，也未发送板载配置保存命令。
+
+温度和占用率通过本机 Gear Link 传感器服务持续采集并缓存。翻页直接发送原厂双信息屏幕数据包，不重新启动原厂 OLED 定时器，因此不需要等待原先的三秒首帧。Codex 额度在后台读取，不阻塞翻页；重复显示同一横幅时直接恢复键盘内已上传的画面。
+
+Codex 页使用 `0x61` 灰阶自定义图片接口：实际内容区为 **208×64**，面板两侧保留状态区域。按 256 像素行宽发送会出现花屏。数据为单帧及 1000 毫秒帧时长头，加 6656 字节像素，共 6660 字节、111 个数据包。原批准的 208×46 大数字布局放在内容区中央，顶部无需原厂 ROG 横幅。此模式已由用户实机确认“ROG 已消失，显示清晰”。控制页仍使用文字横幅接口。
+
+固件确认图片显示后，缓冲区仍需约一秒稳定。连续更新不同图片会在传输中被固件拒绝，因此程序将变化的画面延后到 1.25 秒间隔后上传，等待期间保留已显示内容，并继续处理拨杆翻页；恢复已缓存画面不受此间隔限制。HID 层也有保护，避免其他调用路径过快上传。
+
+当前要求启动时使用可写配置 1–5、且没有已有的自定义拨杆映射。运行中请在停止并恢复之后再切换板载配置或用 Gear Link 修改键盘设置。
+
+## 环境与验证
+
+正式版自带运行时。开发构建使用 Node.js 22+、Python 3、Pillow、hidapi、PyInstaller 和 Windows 自带 .NET Framework C# 编译器；运行 `desktop/构建后台程序.ps1` 构建，再运行 `desktop/安装后台自启.ps1` 安装到当前用户目录并配置登录自启。构建目录不包含接口 Key，安装时仅迁移当前用户 DPAPI 加密后的凭据。
+
+Python 依赖见 `requirements.txt`，可通过 `python -m pip install -r requirements.txt` 安装。构建脚本支持 `AZOTH_PYTHON` 指定解释器；请确保依赖安装在所选解释器中。
+
+- `node --test`：交互状态和额度数据处理验证。
+- `python -m unittest discover -s test -p 'test_*.py'`：图片行宽、帧头、灰阶像素和布局回归验证。
+- `node src/cli.mjs inspect`：只读检查 Gear Link 设备信息。
+- `node src/cli.mjs quota`：只读查询 Codex 额度。
+- `node src/cli.mjs show temperature`（或 `utilization`、`codex`）：请求运行中的程序显示指定页面。
+
+实际设备的上拨、下拨、拨杆按下、按钮事件已分别采集。已验证三种显示页写入成功、进入音量控制状态后超时返回浏览状态、正常停止后恢复原厂映射及监控配置。实机写屏确认：温度／占用率约 2 毫秒，Codex 首次生成约 177 毫秒，重复显示约 2 毫秒。确认时间不等于完整的屏幕可见延迟；用户已实机反馈“已明显变快，切换正常”。
+
+资料：[局域网额度 API 文档](https://github.com/awesomehy/scriptable-codex-usage/blob/main/server/README.md)、[ASUS 原厂功能说明](https://rog.asus.com/us/support/faq/1050647/)。

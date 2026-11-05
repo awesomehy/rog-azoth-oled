@@ -1,0 +1,11 @@
+{
+  "name": "azoth-oled-pages",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "inspect": "node src/cli.mjs inspect",
+    "quota": "node src/cli.mjs quota",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=22" }
+}

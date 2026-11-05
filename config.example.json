@@ -1,0 +1,12 @@
+{
+  "pages": ["temperature", "utilization", "codex"],
+  "defaultPage": "temperature",
+  "adjustmentTimeoutMs": 5000,
+  "hardwareRefreshMs": 1000,
+  "codexRefreshMs": 60000,
+  "codexUsage": {
+    "baseUrl": "http://usage-server.example:58321",
+    "timeoutMs": 25000
+  },
+  "codexDisplayMode": "image"
+}
