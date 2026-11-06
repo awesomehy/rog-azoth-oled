@@ -8,10 +8,18 @@ import { Navigation } from './navigation.mjs';
 import { readCodexUsage } from './usage-api.mjs';
 import { readHardware, hardwarePacket } from './hardware.mjs';
 import { codexModel } from './codex-display.mjs';
+import { RefreshCache } from './refresh-cache.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const local = path.join(root, '.local');
 const config = JSON.parse(await readFile(path.join(root, 'config.json'), 'utf8'));
+let quotaRequests = 0, quotaLastRequestedAt = null;
+const quotaCache = new RefreshCache(() => {
+  quotaRequests++; quotaLastRequestedAt = new Date().toISOString();
+  return readCodexUsage(config.codexUsage);
+}, {
+  maxAgeMs: config.codexCacheMs ?? config.codexRefreshMs,
+});
 const navigation = new Navigation(config);
 const supportedPages = new Set(['temperature', 'utilization', 'codex']);
 if (config.pages.some(page => !supportedPages.has(page))) throw new Error('Unknown display page in config.json');
@@ -20,7 +28,8 @@ const lock = await import('node:fs/promises').then(fs => fs.open(path.join(local
 await lock.writeFile(String(process.pid));
 let keyboard, native, snapshot, interval, quotaInterval, hardwareInterval;
 let closing = false, suppressButton = false, returnPending = false, queue = Promise.resolve(), version = 0;
-let quota = null, quotaAt = 0, quotaPending = null, lastHardwarePage = null;
+let quota = null, quotaPending = null, lastHardwarePage = null;
+let displayWrites = 0, lastDisplayAt = null, lastDisplayCause = null;
 let quotaFetchedAt = null, quotaError = null;
 let preparedCodex = null, storedCodexFrameKey = null;
 let imageUploadedAt = 0, imageRefreshTimer;
@@ -42,7 +51,9 @@ async function status(extra = {}) {
     pid: process.pid, updatedAt: new Date().toISOString(),
     state: closing ? 'stopped' : navigation.browsing ? 'browsing' : 'adjusting',
     page: navigation.page, control: navigation.browsing ? null : controlLabels[navigation.mode] ?? navigation.mode,
-    quota, quotaFetchedAt, quotaError, quotaSource: config.codexUsage.baseUrl, ...extra,
+    quota, quotaFetchedAt, quotaError, quotaSource: config.codexUsage.baseUrl,
+    quotaRequests, quotaLastRequestedAt,
+    displayWrites, lastDisplayAt, lastDisplayCause, ...extra,
   }, null, 2));
 }
 
@@ -84,15 +95,15 @@ async function prepareCodex() {
 
 async function refreshQuota(force = false) {
   if (quotaPending) return quotaPending;
-  if (!force && Date.now() - quotaAt < config.codexRefreshMs) return;
+  if (!force && quotaCache.fresh) return;
   quotaPending = (async () => {
     try {
-      const result = await readCodexUsage(config.codexUsage);
-      quota = result.limits; quotaFetchedAt = result.fetchedAt; quotaError = null; quotaAt = Date.now();
+      const result = await quotaCache.read({ refresh: force });
+      quota = result.limits; quotaFetchedAt = result.fetchedAt; quotaError = null;
     }
     catch (error) {
       quotaError = { code: error.code ?? 'UNAVAILABLE', status: error.status ?? null };
-      log(`Codex quota unavailable: ${quotaError.code}${quotaError.status ? ` HTTP ${quotaError.status}` : ''}`); quotaAt = Date.now();
+      log(`Codex quota unavailable: ${quotaError.code}${quotaError.status ? ` HTTP ${quotaError.status}` : ''}`);
     }
     finally { quotaPending = null; }
     if (!closing && navigation.browsing && navigation.page === 'codex') {
@@ -128,6 +139,13 @@ async function render(expectedVersion = version, cause = 'navigation') {
     void refreshQuota();
     const key = await prepareCodex();
     if (expectedVersion !== version) return;
+    // SHOW restarts the OLED animation and visibly flashes, even for identical
+    // pixels. A successful quota poll must not redisplay an unchanged frame.
+    if (cause === 'data' && (codexDisplayMode === 'image'
+      ? storedCodexFrameKey === key : storedBannerText === `frame:${key}`)) {
+      await status();
+      return;
+    }
     if (codexDisplayMode === 'image') {
       if (storedCodexFrameKey === key) await native.query(codexShowPacket);
       else {
@@ -152,6 +170,7 @@ async function render(expectedVersion = version, cause = 'navigation') {
     } else if (storedBannerText === `frame:${key}`) await native.query(codexShowPacket);
     else { await native.showFrame(key); storedBannerText = `frame:${key}`; }
   } else await hardwarePage(navigation.page);
+  displayWrites++; lastDisplayAt = new Date().toISOString(); lastDisplayCause = cause;
   if (cause !== 'data') log(`display ${displayName} write-ack ${Math.round(performance.now() - requestedAt)}ms`);
   await status();
 }
@@ -285,7 +304,9 @@ try {
     }
   }, 250);
   quotaInterval = setInterval(() => {
-    void refreshQuota();
+    // A fixed polling tick must not be skipped merely because the previous
+    // HTTP response completed a little later than its request started.
+    void refreshQuota(true);
   }, config.codexRefreshMs);
   hardwareInterval = setInterval(() => { void refreshHardware(); }, config.hardwareRefreshMs);
   process.once('SIGINT', () => schedule(() => shutdown()));

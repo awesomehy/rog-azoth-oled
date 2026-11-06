@@ -3,7 +3,8 @@
   "defaultPage": "temperature",
   "adjustmentTimeoutMs": 5000,
   "hardwareRefreshMs": 1000,
-  "codexRefreshMs": 60000,
+  "codexRefreshMs": 30000,
+  "codexCacheMs": 30000,
   "codexUsage": {
     "baseUrl": "http://usage-server.example:58321",
     "timeoutMs": 25000

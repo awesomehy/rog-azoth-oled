@@ -37,12 +37,17 @@
 | `defaultPage` | 启动显示的页面 |
 | `adjustmentTimeoutMs` | 控制模式无操作后返回信息页的毫秒数 |
 | `hardwareRefreshMs` | 后台硬件数据采样间隔，默认一秒；翻页不等待采样 |
-| `codexRefreshMs` | Codex 额度刷新间隔，默认一分钟 |
+| `codexRefreshMs` | Codex 额度请求间隔，默认 30 秒；固定定时请求不会被本地缓存跳过 |
+| `codexCacheMs` | 本地请求结果缓存有效期，默认 30 秒；翻页复用有效缓存及进行中的请求 |
 | `codexDisplayMode` | `image` 使用无 ROG 横幅的自定义图片；`banner` 为旧横幅模式 |
 | `codexUsage.baseUrl` | 自行填写额度服务地址；仓库不含实际接口地址 |
 | `codexUsage.timeoutMs` | 后台 HTTP 请求超时，默认 25 秒；不阻塞拨杆翻页 |
 
 Codex 数据只通过局域网虚拟机的 `GET /api/usage` 读取，不启动或调用本地 Codex。优先显示接口的 `remainingPercent`，以 `windowDurationMins` 判断周期，保留服务器实际抓取时间 `fetchedAt`；缺失值不会显示为零。
+
+普通请求遵循服务端默认最多 30 秒缓存，不使用 `refresh=1` 绕过上游缓存。Codex 画面仅在显示内容变化或用户翻页时更新；请求成功但画面不变时不发送 SHOW 命令，避免重启动画造成闪屏。画面在程序启动、设备重新连接和翻页时重新显示，不做每两秒的周期强制重绘。
+
+开机阶段偶发黑屏的问题仍待进一步验证，尚未确认修复。
 
 首次运行 `设置额度接口Key.ps1`，在本地密码框输入服务端正在使用的 `apiKey`。脚本使用 Bearer 请求头验证数据接口，成功后通过 Windows DPAPI 按当前用户加密保存到 `.local/codex-usage-key.dpapi`，并立即通知运行中的 OLED 程序刷新。Key 不进入普通配置、URL、聊天或日志，也可由 `CODEX_USAGE_API_KEY` 环境变量提供。
 
