@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Security.Principal;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -41,8 +42,10 @@ internal sealed class TrayContext : ApplicationContext {
     private readonly System.Windows.Forms.Timer timer;
     private readonly object logLock = new object();
     private readonly ToolStripMenuItem statusItem;
+    private readonly SessionWindow sessionWindow;
     private Process engine;
     private volatile bool wanted = true, starting = false, exiting = false;
+    private bool sessionEnding = false;
     private DateTime retryAfter = DateTime.MinValue;
     private DateTime stoppingAt = DateTime.MinValue;
 
@@ -61,6 +64,10 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出并恢复原厂显示", null, delegate { exiting = true; Pause(); });
         icon = new NotifyIcon { Icon = SystemIcons.Application, Text = "ROG 夜魔 OLED：正在启动", ContextMenuStrip = menu, Visible = true };
+        sessionWindow = new SessionWindow(this);
+        File.WriteAllText(Path.Combine(local, "session-window.json"), new JavaScriptSerializer().Serialize(new {
+            pid = Process.GetCurrentProcess().Id, handle = sessionWindow.Handle.ToInt64()
+        }));
         timer = new System.Windows.Forms.Timer { Interval = 2000 };
         timer.Tick += delegate { Tick(); }; timer.Start();
         File.WriteAllText(Path.Combine(local, "supervisor-pid"), Process.GetCurrentProcess().Id.ToString());
@@ -86,6 +93,7 @@ internal sealed class TrayContext : ApplicationContext {
         Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -STA -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "设置额度接口Key.ps1") + "\"") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Normal });
     }
     private void Tick() {
+        if (sessionEnding) return;
         string commandPath = Path.Combine(local, "supervisor-command");
         if (File.Exists(commandPath)) {
             try { string command = File.ReadAllText(commandPath).Trim(); File.Delete(commandPath); if (command == "exit") { exiting = true; Pause(); } }
@@ -154,7 +162,83 @@ internal sealed class TrayContext : ApplicationContext {
     }
     private void Finish() {
         timer.Stop(); icon.Visible = false; icon.Dispose(); timer.Dispose();
+        sessionWindow.Dispose();
         try { File.Delete(Path.Combine(local, "supervisor-pid")); } catch { }
+        try { File.Delete(Path.Combine(local, "session-window.json")); } catch { }
         ExitThread();
     }
+
+    internal void PrepareForSessionEnd(IntPtr window, bool critical) {
+        if (sessionEnding) return;
+        sessionEnding = true;
+        if (!wanted || !Alive(engine)) return;
+        try {
+            ShutdownBlockReasonCreate(window, "正在保存键盘开机动画");
+            int engineId = engine.Id;
+            File.WriteAllText(Path.Combine(local, "session-end"), "prepare");
+            Log("preparing startup animation before session end");
+            var deadline = DateTime.UtcNow.AddSeconds(critical ? 2 : 35);
+            while (DateTime.UtcNow < deadline) {
+                var state = Status();
+                if (Value(state, "pid") == engineId.ToString() && Value(state, "state") == "stopped"
+                    && Value(state, "restored") == "True") {
+                    Log("session preparation complete; bootReady=" + Value(state, "bootReady"));
+                    // A completed restoration can still have a quota request
+                    // keeping Node alive. Its device handles have been closed.
+                    if (Alive(engine)) { try { engine.Kill(); } catch { } }
+                    return;
+                }
+                if (!Alive(engine)) { Log("engine exited during session preparation"); return; }
+                Thread.Sleep(100);
+            }
+            Log("session preparation timed out; system shutdown remains allowed");
+        } catch (Exception error) { Log("session preparation: " + error.Message); }
+        finally { ShutdownBlockReasonDestroy(window); }
+    }
+
+    internal void CompleteSessionEnd(bool ending) {
+        if (!ending) {
+            sessionEnding = false; retryAfter = DateTime.MinValue;
+            Log("session end cancelled; resuming display");
+            return;
+        }
+        sessionEnding = false;
+        wanted = false; exiting = true;
+        Log("session ending");
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
+}
+
+internal sealed class SessionWindow : NativeWindow, IDisposable {
+    private readonly TrayContext context;
+
+    internal SessionWindow(TrayContext owner) {
+        context = owner;
+        CreateHandle(new CreateParams { Caption = "ROG Azoth OLED Session", Style = unchecked((int)0x80000000) });
+        // Save the keyboard while Gear Link and the sensor service still exist.
+        SetProcessShutdownParameters(0x3ff, 0);
+    }
+
+    protected override void WndProc(ref Message message) {
+        if (message.Msg == 0x0011) { // WM_QUERYENDSESSION: prepare, then allow shutdown.
+            context.PrepareForSessionEnd(Handle, (message.LParam.ToInt64() & 0x40000000L) != 0);
+            message.Result = new IntPtr(1);
+            return;
+        }
+        if (message.Msg == 0x0016) { // WM_ENDSESSION also reports cancelled shutdown.
+            context.CompleteSessionEnd(message.WParam != IntPtr.Zero);
+            message.Result = IntPtr.Zero;
+            return;
+        }
+        base.WndProc(ref message);
+    }
+
+    public void Dispose() { DestroyHandle(); }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessShutdownParameters(uint level, uint flags);
 }

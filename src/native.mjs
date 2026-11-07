@@ -12,7 +12,7 @@ export function pythonExecutable() {
 }
 
 export class NativeBridge extends EventEmitter {
-  constructor() {
+  constructor({ productId } = {}) {
     super();
     this.nextId = 1;
     this.pending = new Map();
@@ -20,6 +20,10 @@ export class NativeBridge extends EventEmitter {
     const packaged = path.join(root, 'runtime', 'azoth-hid', 'azoth-hid.exe');
     const executable = existsSync(packaged) ? packaged : pythonExecutable();
     const args = existsSync(packaged) ? [] : ['-u', path.join(root, 'native', 'hid_bridge.py')];
+    if (productId !== undefined) {
+      if (![6787, 6789, 6791].includes(productId)) throw new Error('Unsupported M701 product ID');
+      args.push('--product-id', String(productId));
+    }
     this.child = spawn(executable, args, { cwd: root, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let buffer = '';
     this.ready = new Promise((resolve, reject) => {
@@ -35,7 +39,10 @@ export class NativeBridge extends EventEmitter {
         const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         let message;
         try { message = JSON.parse(line); } catch { continue; }
-        if (message.event) this.emit(message.event, message);
+        if (message.event) {
+          if (message.event === 'ready') this.connection = message.connection;
+          this.emit(message.event, message);
+        }
         else {
           const pending = this.pending.get(message.id);
           if (!pending) continue;
@@ -59,7 +66,8 @@ export class NativeBridge extends EventEmitter {
       await this.ready;
       return await new Promise((resolve, reject) => {
         const id = this.nextId++;
-        const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('HID request timed out')); }, 4000);
+        const timeout = message.op === 'show-boot' ? 60000 : this.connection?.kind === 'wireless' ? 15000 : 4000;
+        const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('HID request timed out')); }, timeout);
         this.pending.set(id, { resolve, reject, timer });
         this.child.stdin.write(JSON.stringify({ id, ...message }) + '\n');
       });
@@ -68,6 +76,9 @@ export class NativeBridge extends EventEmitter {
     return operation;
   }
   prepareCodex(model, displayMode = 'banner') { return this.request({ op: 'prepare-codex', model, displayMode }); }
+  initializeDisplay() { return this.request({ op: 'initialize-display' }); }
+  prepareBootAnimation() { return this.request({ op: 'prepare-boot' }); }
+  showBootAnimation(key) { return this.request({ op: 'show-boot', key }); }
   showFrame(key) { return this.request({ op: 'show-frame', key }); }
   enable(mode, enabled) { return this.query([0x71, 0, 0, 0, mode, Number(enabled)]); }
   bind(key, target) { return this.query([0x71, 1, 0, 0, 7, key & 255, key >> 8, target & 255, target >> 8]); }

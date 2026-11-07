@@ -7,6 +7,7 @@ import threading
 import time
 import hashlib
 import struct
+import argparse
 
 for stream in (sys.stdin, sys.stdout, sys.stderr):
     if stream is not None and hasattr(stream, 'reconfigure'):
@@ -16,6 +17,8 @@ root = Path(sys.executable).resolve().parents[2] if getattr(sys, 'frozen', False
 sys.path.insert(0, str(root / '.tools' / 'python'))
 import hid
 from codex_frame import render_codex
+from hid_transport import open_transport
+from boot_animation import load_boot_animation
 
 output_lock = threading.Lock()
 stop = threading.Event()
@@ -27,15 +30,13 @@ def emit(value):
 
 
 class Keyboard:
-    def __init__(self):
-        devices = hid.enumerate(0x0B05, 0x1A83)
-        control = next(d for d in devices if d['usage_page'] == 0xFF00)
-        event = next(d for d in devices if d['usage_page'] == 0xFFC0)
-        self.control = hid.device()
-        self.events = hid.device()
-        self.control.open_path(control['path'])
-        self.events.open_path(event['path'])
+    def __init__(self, product_id=None):
+        self.transport = open_transport(hid, product_id)
+        self.control = self.transport.control
+        self.events = self.transport.events
+        self.data_chunk_size = self.transport.payload_size - 4
         self.frames = {}
+        self.boot_frames = {}
         self.image_ready_at = 0
 
     def query(self, payload):
@@ -44,10 +45,10 @@ class Keyboard:
         # Only commands researched for this device; no flash, reset or profile-save.
         if payload[0] not in (0x12, 0x22, 0x25, 0x51, 0x61, 0x62, 0x66, 0x68, 0x69, 0x71):
             raise ValueError('Command outside OLED/lever adapter scope')
-        self.control.write(bytes([0] + payload + [0] * (64 - len(payload))))
+        self.transport.write(payload)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            reply = self.control.read(65, 100)
+            reply = self.transport.read(100)
             if reply[:2] == [255, 170]:
                 raise RuntimeError(f'M701 firmware rejected command {bytes(payload[:4]).hex()}; reply {bytes(reply[:8]).hex()}')
             match = 4 if payload[:2] in ([0x62, 1], [0x61, 2]) else 2
@@ -72,24 +73,49 @@ class Keyboard:
         image.save(preview)
         return key
 
+    def prepare_boot(self):
+        packed, metadata = load_boot_animation(root, self.transport.metadata['kind'])
+        key = hashlib.sha256(packed).hexdigest()[:16]
+        self.frames[key] = ('image', packed)
+        metadata = {**metadata, 'key': key}
+        self.boot_frames[key] = metadata
+        return metadata
+
+    def show_boot(self, key):
+        metadata = self.boot_frames[key]
+        self.show_frame(key)
+        return metadata
+
+    def upload_image(self, packed):
+        chunk_size = self.data_chunk_size
+        packets = (len(packed) + chunk_size - 1) // chunk_size
+        # The firmware acknowledges SHOW before the image buffer has settled.
+        # A second upload immediately afterwards fails partway through.
+        time.sleep(max(0, self.image_ready_at - time.monotonic()))
+        self.query([0x61, 1, 0, 0] + list(struct.pack('<I', packets)))
+        for index in range(packets):
+            remaining = packets - index - 1
+            self.query([0x61, 2, remaining & 255, remaining >> 8] + list(packed[index * chunk_size:(index + 1) * chunk_size]))
+        self.query([0x61, 3, 0, 0])
+        self.image_ready_at = time.monotonic() + 1.2
+        return True
+
+    def initialize_display(self):
+        # A cold M701 can acknowledge hardware data while its display stays
+        # blank. Initialize the same 208x64 image path that restores it on a
+        # Codex-page visit, once per connection, before drawing the default page.
+        return self.upload_image(struct.pack('<HH', 1, 1000) + bytes(208 * 64 // 2))
+
     def show_frame(self, key):
         display_mode, packed = self.frames[key]
-        packets = (len(packed) + 59) // 60
         if display_mode == 'image':
-            # The firmware acknowledges SHOW before the image buffer has settled.
-            # A second upload immediately afterwards fails partway through.
-            time.sleep(max(0, self.image_ready_at - time.monotonic()))
-            self.query([0x61, 1, 0, 0] + list(struct.pack('<I', packets)))
-            for index in range(packets):
-                remaining = packets - index - 1
-                self.query([0x61, 2, remaining & 255, remaining >> 8] + list(packed[index * 60:(index + 1) * 60]))
-            self.query([0x61, 3, 0, 0])
-            self.image_ready_at = time.monotonic() + 1.2
-            return True
+            return self.upload_image(packed)
+        chunk_size = self.data_chunk_size
+        packets = (len(packed) + chunk_size - 1) // chunk_size
         self.query([0x62, 0, 0, 0, 0, 0, 208, 0, 46, 0, packets, 0])
         for index in range(packets):
             remaining = packets - index - 1
-            self.query([0x62, 1, remaining & 255, remaining >> 8] + list(packed[index * 60:(index + 1) * 60]))
+            self.query([0x62, 1, remaining & 255, remaining >> 8] + list(packed[index * chunk_size:(index + 1) * chunk_size]))
         self.query([0x62, 2, 0, 0])
         return True
 
@@ -106,6 +132,12 @@ def event_loop(keyboard):
             data = keyboard.events.read(65, 150)
             if len(data) < 5:
                 continue
+            expected_report = keyboard.transport.event_report
+            if expected_report is not None and data[0] != expected_report:
+                continue
+            if keyboard.transport.metadata['kind'] == 'wireless' and data[1:3] == [0x81, 3] and data[4] != 1:
+                emit({'event': 'disconnected', 'error': 'Keyboard wireless link changed'})
+                return
             if data[1] == 0x91:
                 emit({'event': 'button', 'mode': data[4]})
             elif data[1] == 0x72:
@@ -153,17 +185,27 @@ def test_single_mode(keyboard):
 
 
 if __name__ == '__main__':
-    keyboard = Keyboard()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--product-id', type=int, choices=(6787, 6789, 6791))
+    parser.add_argument('--test-single-mode', action='store_true')
+    args = parser.parse_args()
+    keyboard = Keyboard(args.product_id)
     threading.Thread(target=event_loop, args=(keyboard,), daemon=True).start()
     try:
-        if '--test-single-mode' in sys.argv:
+        if args.test_single_mode:
             test_single_mode(keyboard)
         else:
-            emit({'event': 'ready'})
+            emit({'event': 'ready', 'connection': keyboard.transport.metadata})
             for line in sys.stdin:
                 message = json.loads(line)
                 try:
-                    if message.get('op') == 'prepare-codex':
+                    if message.get('op') == 'prepare-boot':
+                        result = keyboard.prepare_boot()
+                    elif message.get('op') == 'show-boot':
+                        result = keyboard.show_boot(message['key'])
+                    elif message.get('op') == 'initialize-display':
+                        result = keyboard.initialize_display()
+                    elif message.get('op') == 'prepare-codex':
                         result = keyboard.prepare_frame(message['model'], message.get('displayMode', 'banner'))
                     elif message.get('op') == 'show-frame':
                         result = keyboard.show_frame(message['key'])

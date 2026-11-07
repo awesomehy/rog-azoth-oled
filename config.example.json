@@ -1,6 +1,7 @@
 {
   "pages": ["temperature", "utilization", "codex"],
   "defaultPage": "temperature",
+  "bootAnimation": true,
   "adjustmentTimeoutMs": 5000,
   "hardwareRefreshMs": 1000,
   "codexRefreshMs": 30000,

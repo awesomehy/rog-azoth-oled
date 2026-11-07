@@ -16,6 +16,7 @@ for ($attempt = 0; $attempt -lt 60; $attempt++) {
     } else { break }
     Start-Sleep -Milliseconds 500
 }
+if ($restored -and (Test-Path -LiteralPath (Join-Path $taskDirectory '.local\boot-hardware.json'))) { $restored = $false }
 if ($restored) {
     Write-Host '已停止，并恢复原来的温度页面和拨杆映射。'
 } elseif (Test-Path -LiteralPath (Join-Path $taskDirectory '.local\restore.json')) {

@@ -54,18 +54,25 @@ export async function findKeyboard() {
   const model = 'ROG AZOTH';
   const candidates = await readdir(path.join(root, model), { withFileTypes: true });
   for (const candidate of candidates.filter(item => item.isDirectory())) {
-    const identity = { vid: '2821', pid: '6787', sn: candidate.name };
-    let service;
-    try {
-      service = await GearLink.connect(8000);
-      const info = await service.request('60010000', identity, 3000);
-      if (!info.port || Number(info.port) < 0) continue;
-      const client = await GearLink.connect(Number(info.port));
-      const profilesPath = path.join(root, 'HTML', 'M701', candidate.name, 'm701-PROFILES-DATA');
-      let profiles;
-      try { profiles = JSON.parse(Buffer.from(await readFile(profilesPath, 'utf8'), 'base64').toString('utf8')); } catch {}
-      return { client, identity, info, profiles, root };
-    } finally { service?.close(); }
+    for (const pid of ['6787', '6789', '6791']) {
+      const identity = { vid: '2821', pid, sn: candidate.name };
+      let service, client;
+      try {
+        service = await GearLink.connect(8000);
+        const info = await service.request('60010000', identity, 3000);
+        if (!info.port || Number(info.port) < 0) continue;
+        client = await GearLink.connect(Number(info.port));
+        const device = await client.request('10010001', identity, 2500);
+        if (device.result !== '0' || !['1', '2', '3', '4', '5', '6'].includes(device.profile_index)) continue;
+        const profilesPath = path.join(root, 'HTML', 'M701', candidate.name, 'm701-PROFILES-DATA');
+        let profiles;
+        try { profiles = JSON.parse(Buffer.from(await readFile(profilesPath, 'utf8'), 'base64').toString('utf8')); } catch {}
+        const result = { client, identity, info, profiles, root };
+        client = null;
+        return result;
+      } catch { /* A missing or sleeping connection must not hide another mode. */ }
+      finally { service?.close(); client?.close(); }
+    }
   }
-  throw new Error('Connected ROG AZOTH M701 not found in Gear Link');
+  throw new Error('Connected ROG AZOTH M701 USB/wireless control interface not found in Gear Link');
 }

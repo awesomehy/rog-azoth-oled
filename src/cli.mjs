@@ -18,7 +18,8 @@ try {
     try {
       const device = await keyboard.client.request('10010001', keyboard.identity);
       const mode = await keyboard.client.request('10020001', keyboard.identity);
-      console.log(JSON.stringify({ device, mode, connection: { kind: 'USB', gearLinkPort: keyboard.info.port } }, null, 2));
+      const kind = { '6787': 'USB', '6789': '2.4GHz', '6791': 'Bluetooth' }[keyboard.identity.pid];
+      console.log(JSON.stringify({ device, mode, connection: { kind, gearLinkPort: keyboard.info.port } }, null, 2));
     } finally { keyboard.client.close(); }
   } else throw new Error('Use inspect or quota');
 } catch (error) { console.error(error.message); process.exitCode = 1; }

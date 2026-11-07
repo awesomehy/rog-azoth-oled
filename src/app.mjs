@@ -9,10 +9,14 @@ import { readCodexUsage } from './usage-api.mjs';
 import { readHardware, hardwarePacket } from './hardware.mjs';
 import { codexModel } from './codex-display.mjs';
 import { RefreshCache } from './refresh-cache.mjs';
+import { PageState } from './page-state.mjs';
+import { BootState } from './boot-state.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const local = path.join(root, '.local');
 const config = JSON.parse(await readFile(path.join(root, 'config.json'), 'utf8'));
+const bootEnabled = config.bootAnimation !== false;
+const bootState = new BootState(local);
 let quotaRequests = 0, quotaLastRequestedAt = null;
 const quotaCache = new RefreshCache(() => {
   quotaRequests++; quotaLastRequestedAt = new Date().toISOString();
@@ -20,7 +24,9 @@ const quotaCache = new RefreshCache(() => {
 }, {
   maxAgeMs: config.codexCacheMs ?? config.codexRefreshMs,
 });
-const navigation = new Navigation(config);
+const pageState = new PageState(path.join(local, 'page-state.json'), config.pages);
+const rememberedPage = await pageState.load(path.join(local, 'status.json'));
+const navigation = new Navigation({ ...config, defaultPage: rememberedPage ?? config.defaultPage });
 const supportedPages = new Set(['temperature', 'utilization', 'codex']);
 if (config.pages.some(page => !supportedPages.has(page))) throw new Error('Unknown display page in config.json');
 await mkdir(local, { recursive: true });
@@ -28,6 +34,9 @@ const lock = await import('node:fs/promises').then(fs => fs.open(path.join(local
 await lock.writeFile(String(process.pid));
 let keyboard, native, snapshot, interval, quotaInterval, hardwareInterval;
 let closing = false, suppressButton = false, returnPending = false, queue = Promise.resolve(), version = 0;
+let displayReady = false;
+let pageSaveFailed = false;
+let bootAnimation = null, bootReady = false;
 let quota = null, quotaPending = null, lastHardwarePage = null;
 let displayWrites = 0, lastDisplayAt = null, lastDisplayCause = null;
 let quotaFetchedAt = null, quotaError = null;
@@ -53,6 +62,8 @@ async function status(extra = {}) {
     page: navigation.page, control: navigation.browsing ? null : controlLabels[navigation.mode] ?? navigation.mode,
     quota, quotaFetchedAt, quotaError, quotaSource: config.codexUsage.baseUrl,
     quotaRequests, quotaLastRequestedAt,
+    connection: native?.connection ?? null,
+    bootAnimation, bootReady,
     displayWrites, lastDisplayAt, lastDisplayCause, ...extra,
   }, null, 2));
 }
@@ -93,6 +104,21 @@ async function prepareCodex() {
   return preparedCodex.key;
 }
 
+async function showBootAnimation() {
+  const animation = await native.prepareBootAnimation();
+  const connection = native.connection.kind;
+  if (await bootState.matches(animation, keyboard.identity, snapshot.profile, connection)) {
+    await native.query([0x61, 3, 0, 0]);
+  } else {
+    await bootState.invalidate();
+    await native.showBootAnimation(animation.key);
+    await bootState.commit(animation, keyboard.identity, snapshot.profile, connection);
+  }
+  bootAnimation = animation;
+  log(`boot animation ${animation.brand} ready`);
+  return animation;
+}
+
 async function refreshQuota(force = false) {
   if (quotaPending) return quotaPending;
   if (!force && quotaCache.fresh) return;
@@ -106,7 +132,7 @@ async function refreshQuota(force = false) {
       log(`Codex quota unavailable: ${quotaError.code}${quotaError.status ? ` HTTP ${quotaError.status}` : ''}`);
     }
     finally { quotaPending = null; }
-    if (!closing && navigation.browsing && navigation.page === 'codex') {
+    if (!closing && displayReady && navigation.browsing && navigation.page === 'codex') {
       const expected = version;
       schedule(() => render(expected, 'data'));
     }
@@ -130,10 +156,24 @@ async function refreshHardware() {
 }
 
 async function render(expectedVersion = version, cause = 'navigation') {
+  if (closing || !displayReady || expectedVersion !== version) return;
+  try { await pageState.save(navigation.page); pageSaveFailed = false; }
+  catch (error) {
+    if (!pageSaveFailed) log(`Page memory unavailable: ${error.code ?? 'WRITE_FAILED'}`);
+    pageSaveFailed = true;
+  }
   if (closing || expectedVersion !== version) return;
   const requestedAt = lastRequestedAt;
   const displayName = navigation.browsing ? navigation.page : `control ${navigation.mode}`;
   if (!navigation.browsing) {
+    if (native.connection?.kind === 'wireless') {
+      // The keyboard already draws its original adjustment screen. Gear Link's
+      // legacy banner writer uses USB-sized chunks on an OMNI connection.
+      lastDisplayAt = new Date().toISOString(); lastDisplayCause = 'native-control';
+      log(`display ${displayName} native`);
+      await status();
+      return;
+    }
     await banner(`${controlLabels[navigation.mode] ?? 'CONTROL'}\nUP / DOWN TO ADJUST`);
   } else if (navigation.page === 'codex') {
     void refreshQuota();
@@ -163,6 +203,7 @@ async function render(expectedVersion = version, cause = 'navigation') {
           }, wait);
         } else {
           clearTimeout(imageRefreshTimer);
+          await bootState.invalidate();
           await native.showFrame(key);
           imageUploadedAt = Date.now(); storedCodexFrameKey = key;
         }
@@ -198,6 +239,7 @@ async function shutdown(reason = 'stopped') {
   clearTimeout(imageRefreshTimer);
   log(`stopping: ${reason}`);
   let restored = false;
+  const retainBoot = bootEnabled && reason === 'session ending';
   try {
     if (snapshot && native) {
       suppressButton = true;
@@ -205,14 +247,25 @@ async function shutdown(reason = 'stopped') {
       for (const key of [164, 165, 166]) await native.bind(key, 255);
       for (const mode of snapshot.enabledControls) await native.enable(mode, true);
       await native.enable(7, snapshot.browseOriginallyEnabled);
-      if (Number.isInteger(snapshot.animationPreset)) await native.query([0x61, 0, 0, 0, snapshot.animationPreset]);
-      if (keyboard) {
+      if (retainBoot) {
+        await bootState.rememberHardware(snapshot, keyboard.root);
+        const pausedHardware = { ...snapshot.hardware, on_off: '0' };
+        await gear('50090001', pausedHardware);
+        await writeFile(snapshot.hardwarePath, JSON.stringify(pausedHardware));
+        await showBootAnimation();
+        bootReady = true;
+      } else if (keyboard) {
+        await bootState.restoreHardwareFile(keyboard.root);
+        if (Number.isInteger(snapshot.animationPreset)) await native.query([0x61, 0, 0, 0, snapshot.animationPreset]);
         await gear('50090001', snapshot.hardware);
         await writeFile(snapshot.hardwarePath, snapshot.hardwareOriginalText);
       }
       restored = true;
     }
-  } catch (error) { log(`RESTORE REQUIRED: ${error.message}`); }
+  } catch (error) {
+    log(`RESTORE REQUIRED: ${error.message}`);
+    if (retainBoot && keyboard) await bootState.restoreHardwareFile(keyboard.root).catch(() => {});
+  }
   finally {
     native?.close(); keyboard?.client.close();
     await status({ restored, reason }).catch(() => {});
@@ -225,7 +278,9 @@ async function shutdown(reason = 'stopped') {
 
 try {
   await rm(path.join(local, 'stop'), { force: true });
+  await rm(path.join(local, 'session-end'), { force: true });
   keyboard = await findKeyboard();
+  await bootState.restoreHardwareFile(keyboard.root);
   const device = await keyboard.client.request('10010001', keyboard.identity);
   const profile = keyboard.profiles?.data.find(item => item.value === device.profile_index);
   if (!profile || profile.value === '6') throw new Error('Select a writable Gear Link profile (1–5) first');
@@ -245,7 +300,7 @@ try {
     animationPreset: profile.oled.defaultAnimation ?? 0,
   };
   await writeFile(path.join(local, 'restore.json'), JSON.stringify(snapshot, null, 2));
-  native = new NativeBridge();
+  native = new NativeBridge({ productId: Number(keyboard.identity.pid) });
   native.on('diagnostic', line => log(`HID: ${line.trim()}`));
   await native.ready;
   lastHardwarePage = 'temperature';
@@ -255,6 +310,19 @@ try {
   await native.enable(7, true);
   for (const key of [164, 165, 166]) await native.bind(key, 0);
   await returnToBrowsing();
+  // Data ACKs alone do not guarantee a visible picture after a cold boot.
+  // Initialize the image renderer once, without waiting for the quota service
+  // or periodically sending SHOW (which would reintroduce OLED flicker).
+  if (bootEnabled) {
+    const animation = await showBootAnimation();
+    await delay(Math.max(1250, animation.durationMs));
+  } else {
+    await bootState.invalidate();
+    await native.initializeDisplay();
+    await delay(1250);
+  }
+  displayReady = true;
+  log('display initialized');
   native.on('button', ({ mode }) => {
     if (closing || suppressButton) return;
     navigation.button(mode);
@@ -274,8 +342,12 @@ try {
     status().catch(() => {});
   });
   native.on('disconnected', () => { if (!closing) shutdown('keyboard disconnected'); });
-  await render();
+  await schedule(() => render(version, 'startup'));
   interval = setInterval(() => {
+    access(path.join(local, 'session-end')).then(async () => {
+      await rm(path.join(local, 'session-end'), { force: true });
+      schedule(() => shutdown('session ending'));
+    }).catch(() => {});
     access(path.join(local, 'stop')).then(() => schedule(() => shutdown())).catch(() => {});
     access(path.join(local, 'refresh-quota')).then(async () => {
       await rm(path.join(local, 'refresh-quota'), { force: true });
